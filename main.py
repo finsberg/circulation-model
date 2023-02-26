@@ -1,11 +1,15 @@
-"""Attempt to implement model in Circulation model 
+"""Attempt to implement model in Circulation model
 in https://doi.org/10.1016/j.jcp.2022.111083
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Sequence
 import numpy as np
+
 from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+
+import regazzoni2022
 
 
 def phi(t, t_C, t_R, T_C, T_R, T_HB):
@@ -14,7 +18,7 @@ def phi(t, t_C, t_R, T_C, T_R, T_HB):
         return 0.5 * (1 - np.cos((np.pi / T_C) * x))
 
     if 0 <= (x := (t - t_R) % T_HB) < T_R:
-        return 0.5 * (1 - np.cos((np.pi / T_R) * x))
+        return 0.5 * (1 + np.cos((np.pi / T_R) * x))
 
     return 0
 
@@ -27,8 +31,9 @@ class Chamber:
     T_C: float
     T_R: float
     V_0: float
-    T_HB: float = 0.8
-    _V: float = 0.0
+    T_HB: float = 1.0
+    name: str = "Chamber"
+    _V: float = field(default=0.0, repr=False)
 
     @property
     def t_R(self) -> float:
@@ -56,8 +61,8 @@ class Circulation:
     C: float
     L: float
     name: str
-    _Q: float = 0.0
-    _p: float = 0.0
+    _Q: float = field(default=0.0, repr=False)
+    _p: float = field(default=0.0, repr=False)
 
     def Q(self, t) -> float:
         return self._Q
@@ -102,7 +107,37 @@ class System:
     TV: Valve
     PV: Valve
 
-    def _update_states(self, y):
+    @property
+    def num_c1(self) -> int:
+        return 12
+
+    @property
+    def num_c2(self) -> int:
+        return 8
+
+    @property
+    def c1(self) -> np.ndarray:
+        return np.array(
+            [
+                self.LA._V,
+                self.LV._V,
+                self.RA._V,
+                self.RV._V,
+                self.AR_SYS._p,
+                self.VEN_SYS._p,
+                self.AR_PUL._p,
+                self.VEN_PUL._p,
+                self.AR_SYS._Q,
+                self.VEN_SYS._Q,
+                self.AR_PUL._Q,
+                self.VEN_PUL._Q,
+            ]
+        )
+
+    @c1.setter
+    def c1(self, y: Sequence) -> None:
+        if not len(y) == 12:
+            raise ValueError("State must have length 12")
         self.LA._V = y[0]
         self.LV._V = y[1]
         self.RA._V = y[2]
@@ -116,9 +151,24 @@ class System:
         self.AR_PUL._Q = y[10]
         self.VEN_PUL._Q = y[11]
 
+    def c2(self, t, c1) -> np.ndarray:
+        self.c1 = c1
+        return np.array(
+            [
+                self.LV.p(t),
+                self.LA.p(t),
+                self.RV.p(t),
+                self.RA.p(t),
+                self.MV.Q(t),
+                self.AV.Q(t),
+                self.TV.Q(t),
+                self.PV.Q(t),
+            ]
+        )
+
     def __call__(self, t, y):
 
-        self._update_states(y)
+        self.c1 = y
         values = np.zeros(12)
         # V_LA
         values[0] = self.VEN_PUL.Q(t) - self.MV.Q(t)
@@ -159,31 +209,63 @@ def main():
 
     R_min = 0.0075
     R_max = 75_000
+    T_HB = 0.8
 
-    LV = Chamber(E_pass=0.05, E_act_max=0.55, V_0=10.0, t_C=0.0, T_C=0.272, T_R=0.12)
-    RV = Chamber(E_pass=0.05, E_act_max=0.55, V_0=10.0, t_C=0.0, T_C=0.272, T_R=0.12)
-    LA = Chamber(E_pass=0.09, E_act_max=0.07, V_0=4.0, t_C=0.6, T_C=0.104, T_R=0.68)
-    RA = Chamber(E_pass=0.07, E_act_max=0.06, V_0=4.0, t_C=0.56, T_C=0.064, T_R=0.64)
+    params = regazzoni2022.parameters
 
-    AR_SYS = Circulation(R=0.8, C=1.2, L=5e-3, name="Arterial (systemic)")
-    AR_PUL = Circulation(R=0.1625, C=10.0, L=5e-4, name="Arterial (pulmonary)")
-    VEN_SYS = Circulation(R=0.26, C=60.0, L=5e-4, name="Venous (systemic)")
-    VEN_PUL = Circulation(R=0.1625, C=16.0, L=5e-4, name="Venous (pulmonary)")
+    chambers = {}
+    for name in ["LV", "RV", "RA", "LA"]:
+        values: regazzoni2022.Chamber = getattr(params, name)
+        chambers[name] = Chamber(
+            E_pass=values.E_pass.m,
+            E_act_max=values.E_act_max.m,
+            V_0=values.V_0.m,
+            t_C=values.t_C.m,
+            T_C=values.T_C.m,
+            T_R=values.T_R.m,
+            T_HB=T_HB,
+            name=name,
+        )
+        print(chambers[name])
 
-    MV = Valve(fst=LA, snd=LV, R_min=R_min, R_max=R_max, name="Mitral")
-    AV = Valve(fst=LV, snd=AR_SYS, R_min=R_min, R_max=R_max, name="Aortic")
-    TV = Valve(fst=RA, snd=RV, R_min=R_min, R_max=R_max, name="Tricuspid")
-    PV = Valve(fst=RV, snd=VEN_PUL, R_min=R_min, R_max=R_max, name="Pulmonary")
+    circs = {}
+    for name in ["AR_SYS", "AR_PUL", "VEN_SYS", "VEN_PUL"]:
+        values: regazzoni2022.Circulation = getattr(params, name)
+        circs[name] = Circulation(R=values.R.m, C=values.C.m, L=values.L.m, name=name)
+        print(circs[name])
+
+    MV = Valve(
+        fst=chambers["LA"],
+        snd=chambers["LV"],
+        R_min=R_min,
+        R_max=R_max,
+        name="Mitral",
+    )
+    AV = Valve(
+        fst=chambers["LV"],
+        snd=circs["AR_SYS"],
+        R_min=R_min,
+        R_max=R_max,
+        name="Aortic",
+    )
+    TV = Valve(
+        fst=chambers["RA"],
+        snd=chambers["RV"],
+        R_min=R_min,
+        R_max=R_max,
+        name="Tricuspid",
+    )
+    PV = Valve(
+        fst=chambers["RV"],
+        snd=circs["VEN_PUL"],
+        R_min=R_min,
+        R_max=R_max,
+        name="Pulmonary",
+    )
 
     system = System(
-        LV=LV,
-        RV=RV,
-        LA=LA,
-        RA=RA,
-        AR_SYS=AR_SYS,
-        AR_PUL=AR_PUL,
-        VEN_SYS=VEN_SYS,
-        VEN_PUL=VEN_PUL,
+        **chambers,
+        **circs,
         MV=MV,
         AV=AV,
         TV=TV,
@@ -206,21 +288,51 @@ def main():
             0.0,  # Q_VEN_PUL
         ]
     )
-    res = solve_ivp(system, t_span=(0.0, 10.0), y0=y0)
-    V_LV = res.y[1, :]
+    res = solve_ivp(system, t_span=(0.0, 100.0), y0=y0, method="Radau")
+
     t = res.t
-    P_LV = [LV.p(ti) for ti in t]
-    fig, ax = plt.subplots()
+    c1 = res.y
+    c2 = np.zeros((system.num_c2, t.size))
+    for i, ti in enumerate(t):
+        c2[:, i] = system.c2(ti, c1[:, i])
 
-    def animate(i):
-        ax.clear()
-        ax.set_xlim(30, 190)
-        ax.set_ylim(0, 20)
-        ax.plot(V_LV[:i], P_LV[:i])
+    V_LV = c1[1, :]
+    V_RV = c1[3, :]
 
-    ani = animation.FuncAnimation(fig, animate, interval=20, frames=len(V_LV))
-    # ani.save("movie.mp4")
+    P_LV = c2[0, :]
+    P_RV = c2[2, :]
 
+    animate = True
+
+    if animate:
+        fig, ax = plt.subplots(1, 2)
+
+        def animate(i):
+            start = max(i - 100, 0)
+            ax[0].clear()
+            ax[0].set_xlim(0, 70)
+            ax[0].set_ylim(0, 40)
+            ax[0].text(0.02, 0.90, f"time = {t[i]:.1f}", transform=ax[0].transAxes)
+            ax[0].plot(V_LV[start:i], P_LV[start:i])
+            ax[1].clear()
+            ax[1].set_xlim(70, 150)
+            ax[1].set_ylim(0, 90)
+            ax[1].plot(V_RV[start:i], P_RV[start:i])
+
+        ani = animation.FuncAnimation(fig, animate, interval=1, frames=len(V_LV))
+        plt.show()
+
+    fig, ax = plt.subplots(1, 2)
+
+    ax[0].plot(V_LV, P_LV)
+    ax[0].set_title("LV")
+    ax[0].set_xlabel("Volume [ml]")
+    ax[0].set_ylabel("Pressure [mmHg]")
+
+    ax[1].plot(V_RV, P_RV)
+    ax[1].set_title("RV")
+    ax[1].set_xlabel("Volume [ml]")
+    ax[1].set_ylabel("Pressure [mmHg]")
     plt.show()
 
 
